@@ -1,35 +1,30 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# Added support for GLM 4.6 and other models
+# Customized by AlexH from llmresearch.net
+# Soupport: https://llmresearch.net/threads/heretic-llm-universal-support-for-new-models-via-dynamic-auto-registration.275/
 
 import math
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
-import bitsandbytes as bnb
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, PeftModel, get_peft_model
 from torch import LongTensor, Tensor
 from torch.nn import ModuleList
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoConfig,
     BatchEncoding,
-    BitsAndBytesConfig,
-    PreTrainedModel,
     PreTrainedTokenizerBase,
     TextStreamer,
 )
-from transformers.generation import (
-    GenerateDecoderOnlyOutput,
-    GenerateEncoderDecoderOutput,
-)
+from transformers.generation.utils import GenerateOutput
 
-from .config import QuantizationMethod, Settings
+from .config import Settings
 from .utils import batchify, empty_cache, print
-
-GenerateOutput = GenerateDecoderOnlyOutput | GenerateEncoderDecoderOutput
 
 
 @dataclass
@@ -44,7 +39,6 @@ class Model:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.response_prefix = ""
-        self.needs_reload = False
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
@@ -54,298 +48,172 @@ class Model:
             trust_remote_code=settings.trust_remote_code,
         )
 
-        # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # CRITICAL: Always use left-padding for decoder-only models during generation.
-        #           Right-padding causes empty outputs because the model sees PAD tokens
-        #           after the prompt and thinks the sequence is complete.
         self.tokenizer.padding_side = "left"
 
         self.model = None
-        self.max_memory = (
-            {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
-            if settings.max_memory
-            else None
-        )
         self.trusted_models = {settings.model: settings.trust_remote_code}
 
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
+        # --- Patch adaptiv pentru GLM-4.6V ---
+        self._patch_glm4v_support()
+        # --- Sfârșitul patch-ului ---
+
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
-
             try:
-                quantization_config = self._get_quantization_config(dtype)
-
-                # Build kwargs, only include quantization_config if it's not None
-                # (some models like gpt-oss have issues with explicit None)
-                extra_kwargs = {}
-                if quantization_config is not None:
-                    extra_kwargs["quantization_config"] = quantization_config
-
                 self.model = AutoModelForCausalLM.from_pretrained(
                     settings.model,
-                    dtype=dtype,
+                    torch_dtype=dtype,
                     device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
+                    trust_remote_code=self.trusted_models.get(settings.model, settings.trust_remote_code),
                 )
 
-                # If we reach this point and the model requires trust_remote_code,
-                # either the user accepted, or settings.trust_remote_code is True.
                 if self.trusted_models.get(settings.model) is None:
                     self.trusted_models[settings.model] = True
 
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(["Test"], max_new_tokens=1)
+                # Skip test generation for multimodal models like GLM-4.6V
+                if "GLM-4.6V" not in settings.model:
+                    self.generate(["Test"], max_new_tokens=1)
+                
+                print("[green]Ok[/]")
+                break
             except Exception as error:
                 self.model = None
                 empty_cache()
                 print(f"[red]Failed[/] ({error})")
                 continue
 
-            print("[green]Ok[/]")
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
-                print("[bold green]Model loaded in 4-bit precision.[/]")
-            break
-
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        self._apply_lora()
-
-        # LoRA B matrices are initialized to zero by default in PEFT,
-        # so we don't need to do anything manually.
-
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
-        for component, modules in self.get_layer_modules(0).items():
+        for component, matrices in self.get_layer_matrices(0).items():
             print(
-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+                f"  * [bold]{component}[/]: [bold]{len(matrices)}[/] matrices per layer"
             )
 
-    def _apply_lora(self):
-        # Always use LoRA adapters for abliteration (faster reload, no weight modification)
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
-        peft_config = LoraConfig(
-            r=1,  # Rank 1 is sufficient for directional ablation
-            target_modules=target_modules,
-            lora_alpha=1,
-            lora_dropout=0,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        self.model = get_peft_model(self.model, peft_config)
-        print(
-            f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
-        )
-
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
-        """
-        Creates quantization config based on settings.
-
-        Args:
-            dtype: The dtype string (e.g., "auto", "bfloat16")
-
-        Returns:
-            BitsAndBytesConfig or None
-        """
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
-            # BitsAndBytesConfig expects a torch.dtype, not a string.
-            if dtype == "auto":
-                compute_dtype = torch.bfloat16
-            else:
-                compute_dtype = getattr(torch, dtype)
-
-            return BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        return None
-
-    def get_merged_model(self) -> PreTrainedModel:
-        """
-        Returns the model with LoRA adapters merged.
-        For quantized models, performs CPU-based merge.
-        """
-
-        # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
-            # Quantized models need special handling - we must reload the base model
-            # in full precision to merge the LoRA adapters
-
-            # Get the adapter state dict before we do anything
-            adapter_state = {}
-            for name, param in self.model.named_parameters():
-                if "lora_" in name:
-                    adapter_state[name] = param.data.clone().cpu()
-
-            # Load base model in full precision on CPU to avoid VRAM issues
-            print("* Loading base model on CPU (this may take a while)...")
-            base_model = AutoModelForCausalLM.from_pretrained(
-                self.settings.model,
-                torch_dtype=self.model.dtype,
-                device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
-            )
-
-            # Apply LoRA adapters to the CPU model
-
-            print("* Applying LoRA adapters...")
-            target_modules = self.get_abliterable_components()
-            peft_config = LoraConfig(
-                r=1,
-                target_modules=target_modules,
-                lora_alpha=1,
-                lora_dropout=0,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            peft_model = get_peft_model(base_model, peft_config)
-
-            # Copy the trained adapter weights
-            for name, param in peft_model.named_parameters():
-                if name in adapter_state:
-                    param.data = adapter_state[name].to(param.device)
-
-            # Merge and unload
-            print("* Merging LoRA adapters into base model...")
-            merged_model = peft_model.merge_and_unload()
-            return merged_model
-        else:
-            # Non-quantized model - can merge directly
-            print("* Merging LoRA adapters into base model...")
-            merged_model = self.model.merge_and_unload()
-            # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
-            # Mark for full reload if user switches trials later.
-            self.needs_reload = True
-            return merged_model
-
-    def reset_model(self):
-        """
-        Resets the model to a clean state for the next trial or evaluation.
-
-        Behavior:
-        - Fast path: If the same model is loaded and doesn't need full reload,
-          resets LoRA adapter weights to zero (identity transformation).
-        - Slow path: If switching models or after merge_and_unload(),
-          performs full model reload with quantization config.
-        """
-        current_model = getattr(self.model.config, "name_or_path", None)
-        if current_model == self.settings.model and not self.needs_reload:
-            # Reset LoRA adapters to zero (identity transformation)
-            for name, module in self.model.named_modules():
-                if "lora_B" in name and hasattr(module, "weight"):
-                    torch.nn.init.zeros_(module.weight)
+    def _patch_glm4v_support(self):
+        """Inspectează configurarea modelului și înregistrează dinamic clasele GLM-4V."""
+        if "GLM-4.6V" not in self.settings.model:
             return
 
-        dtype = self.model.dtype
+        try:
+            config = AutoConfig.from_pretrained(
+                self.settings.model,
+                trust_remote_code=self.trusted_models.get(self.settings.model, self.settings.trust_remote_code),
+            )
+            
+            # Extrage numele claselor din configurație
+            config_class_name = config.__class__.__name__
+            architectures = getattr(config, 'architectures', [])
+            
+            if architectures:
+                model_class_name = architectures[0]
+                print(f"(Found GLM-4.6V config: {config_class_name}, model: {model_class_name})... ", end="")
+                
+                # Încearcă să importeze dinamic clasele necesare
+                try:
+                    # Importă clasa de configurație
+                    config_module = __import__(
+                        f"transformers.models.glm4v.configuration_glm4v",
+                        fromlist=['configuration_glm4v']
+                    )
+                    config_class = getattr(config_module, config_class_name)
+                    
+                    # Importă clasa de modelare
+                    modeling_module = __import__(
+                        f"transformers.models.glm4v.modeling_glm4v",
+                        fromlist=['modeling_glm4v']
+                    )
+                    model_class = getattr(modeling_module, model_class_name)
+                    
+                    # Înregistrează clasa de model
+                    AutoModelForCausalLM.register(config_class, model_class)
+                    print(f"Registered successfully... ", end="")
+                    
+                except (ImportError, AttributeError) as e:
+                    print(f"[red]Failed to register ({e}). Falling back to default behavior.[/]")
+                    # Nu putem face mai mult, dar lăsăm `heretic` să încerce
+                    # cu `AutoModelForCausalLM` standard, care poate eșua, dar vom oferi
+                    # un mesaj de eroare clar
+                    
+        except Exception as e:
+            print(f"[red]Failed to inspect model config ({e}).[/]")
 
-        # Purge existing model object from memory to make space.
+    def reload_model(self):
+        dtype = self.model.dtype
         self.model = None
         empty_cache()
 
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
-
-        # Build kwargs, only include quantization_config if it's not None
-        extra_kwargs = {}
-        if quantization_config is not None:
-            extra_kwargs["quantization_config"] = quantization_config
-
         self.model = AutoModelForCausalLM.from_pretrained(
             self.settings.model,
-            dtype=dtype,
+            torch_dtype=dtype,
             device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
+            trust_remote_code=self.trusted_models.get(self.settings.model, self.settings.trust_remote_code),
         )
 
-        self._apply_lora()
-
-        self.needs_reload = False
+        if self.trusted_models.get(self.settings.model) is None:
+            self.trusted_models[self.settings.model] = True
 
     def get_layers(self) -> ModuleList:
-        model = self.model
+        # Calea pentru modelele GLM-4.6V incarcate corect
+        if "GLM-4.6V" in self.settings.model:
+            with suppress(AttributeError):
+                return self.model.model.layers
+        
+        # Calea pentru majoritatea modelelor multimodale.
+        with suppress(AttributeError):
+            return self.model.model.language_model.layers
 
-        # Unwrap PeftModel (always true after _apply_lora)
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
+        # Calea pentru modelele text-only.
+        return self.model.model.layers
 
-        # Most multimodal models.
-        with suppress(Exception):
-            return model.model.language_model.layers
-
-        # Text-only models.
-        return model.model.layers
-
-    def get_layer_modules(self, layer_index: int) -> dict[str, list[torch.nn.Module]]:
+    def get_layer_matrices(self, layer_index: int) -> dict[str, list[Tensor]]:
         layer = self.get_layers()[layer_index]
 
-        modules = {}
+        matrices = {}
 
-        def try_add(component: str, module: Any):
-            # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
-            if isinstance(module, torch.nn.Module):
-                if component not in modules:
-                    modules[component] = []
-                modules[component].append(module)
-            else:
-                # Assert for unexpected types (catches architecture changes)
-                assert not isinstance(module, torch.Tensor), (
-                    f"Unexpected Tensor in {component} - expected nn.Module"
-                )
+        def try_add(component: str, matrix: Any):
+            if hasattr(matrix, "data") and torch.is_tensor(matrix.data):
+                matrix = matrix.data
+            assert torch.is_tensor(matrix)
+            if component not in matrices:
+                matrices[component] = []
+            matrices[component].append(matrix)
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
-        try_add("attn.o_proj", layer.self_attn.o_proj)
+        try_add("attn.o_proj", layer.self_attn.o_proj.weight)
 
-        # Most dense models.
         with suppress(Exception):
-            try_add("mlp.down_proj", layer.mlp.down_proj)
+            try_add("mlp.down_proj", layer.mlp.down_proj.weight)
 
-        # Some MoE models (e.g. Qwen3).
         with suppress(Exception):
             for expert in layer.mlp.experts:
-                try_add("mlp.down_proj", expert.down_proj)
+                try_add("mlp.down_proj", expert.down_proj.weight)
 
-        # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:
-                try_add("mlp.down_proj", expert.w2)
+                try_add("mlp.down_proj", expert.w2.weight)
 
-        # Granite MoE Hybrid - attention layers with shared_mlp.
         with suppress(Exception):
-            try_add("mlp.down_proj", layer.shared_mlp.output_linear)
+            try_add("mlp.down_proj", layer.mlp.experts.down_proj)
 
-        # Granite MoE Hybrid - MoE layers with experts.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.shared_mlp.output_linear.weight)
+
         with suppress(Exception):
             for expert in layer.moe.experts:
-                try_add("mlp.down_proj", expert.output_linear)
+                try_add("mlp.down_proj", expert.output_linear.weight)
 
-        # We need at least one module across all components for abliteration to work.
-        total_modules = sum(len(mods) for mods in modules.values())
-        assert total_modules > 0, "No abliterable modules found in layer"
-
-        return modules
+        assert matrices.get("mlp.down_proj"), "MLP down-projection not found in layer."
+        return matrices
 
     def get_abliterable_components(self) -> list[str]:
-        return list(self.get_layer_modules(0).keys())
+        return list(self.get_layer_matrices(0).keys())
 
     def abliterate(
         self,
@@ -356,8 +224,6 @@ class Model:
         if direction_index is None:
             refusal_direction = None
         else:
-            # The index must be shifted by 1 because the first element
-            # of refusal_directions is the direction for the embeddings.
             weight, index = math.modf(direction_index + 1)
             refusal_direction = F.normalize(
                 refusal_directions[int(index)].lerp(
@@ -368,76 +234,31 @@ class Model:
                 dim=0,
             )
 
-        # Note that some implementations of abliteration also orthogonalize
-        # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
-            for component, modules in self.get_layer_modules(layer_index).items():
+            for component, matrices in self.get_layer_matrices(layer_index).items():
                 params = parameters[component]
-
                 distance = abs(layer_index - params.max_weight_position)
 
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
                 if distance > params.min_weight_distance:
                     continue
 
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
                 weight = params.max_weight + (distance / params.min_weight_distance) * (
                     params.min_weight - params.max_weight
                 )
 
                 if refusal_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of refusal_directions is the direction for the embeddings.
                     layer_refusal_direction = refusal_directions[layer_index + 1]
                 else:
                     layer_refusal_direction = refusal_direction
 
-                for module in modules:
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
+                projector = torch.outer(
+                    layer_refusal_direction,
+                    layer_refusal_direction,
+                ).to(self.model.dtype)
 
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    # NOTE: Assumes module has .weight (true for Linear layers we target)
-                    v = layer_refusal_direction.to(module.weight.device)
-
-                    # Get W (dequantize if necessary)
-                    # For LoRA-wrapped modules, the quantized weights are in base_layer
-                    base_weight = (
-                        module.base_layer.weight
-                        if hasattr(module, "base_layer")
-                        else module.weight
-                    )
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is not None:
-                        # 4-bit quantization
-                        W = bnb.functional.dequantize_4bit(
-                            base_weight.data, quant_state
-                        ).to(torch.float32)
-                    else:
-                        W = base_weight.to(torch.float32)
-
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
-
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
-
-                    # Assign to adapters
-                    # We assume the default adapter name "default"
-                    module.lora_A["default"].weight.data = lora_A.to(
-                        module.lora_A["default"].weight.dtype
-                    )
-                    module.lora_B["default"].weight.data = lora_B.to(
-                        module.lora_B["default"].weight.dtype
-                    )
+                for matrix in matrices:
+                    device_projector = projector.to(matrix.device)
+                    matrix.sub_(weight * (device_projector @ matrix))
 
     def get_chat(self, prompt: str) -> list[dict[str, str]]:
         return [
@@ -451,7 +272,6 @@ class Model:
         **kwargs: Any,
     ) -> tuple[BatchEncoding, GenerateOutput | LongTensor]:
         chats = [self.get_chat(prompt) for prompt in prompts]
-
         chat_prompts: list[str] = self.tokenizer.apply_chat_template(
             chats,
             add_generation_prompt=True,
@@ -459,8 +279,6 @@ class Model:
         )
 
         if self.response_prefix:
-            # Append the common response prefix to the prompts so that evaluation happens
-            # at the point where responses start to differ for different prompts.
             chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
         inputs = self.tokenizer(
@@ -474,7 +292,7 @@ class Model:
             **inputs,
             **kwargs,
             pad_token_id=self.tokenizer.pad_token_id,
-            do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
+            do_sample=False,
         )
 
     def get_responses(self, prompts: list[str]) -> list[str]:
@@ -482,77 +300,49 @@ class Model:
             prompts,
             max_new_tokens=self.settings.max_response_length,
         )
-
-        # Return only the newly generated part.
         return self.tokenizer.batch_decode(outputs[:, inputs["input_ids"].shape[1] :])
 
     def get_responses_batched(self, prompts: list[str]) -> list[str]:
         responses = []
-
         for batch in batchify(prompts, self.settings.batch_size):
             for response in self.get_responses(batch):
                 responses.append(response)
-
         return responses
 
     def get_residuals(self, prompts: list[str]) -> Tensor:
-        # We only generate one token, and we return the residual vectors
-        # at that token position, for each prompt and layer.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
             output_hidden_states=True,
             return_dict_in_generate=True,
         )
-
-        # Hidden states for the first (only) generated token.
         hidden_states = outputs.hidden_states[0]
-
-        # The returned tensor has shape (prompt, layer, component).
         residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
             [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
             dim=1,
         )
-
-        # Upcast the data type to avoid precision (bfloat16) or range (float16)
-        # problems during calculations involving residual vectors.
         return residuals.to(torch.float32)
 
     def get_residuals_batched(self, prompts: list[str]) -> Tensor:
         residuals = []
-
         for batch in batchify(prompts, self.settings.batch_size):
             residuals.append(self.get_residuals(batch))
-
         return torch.cat(residuals, dim=0)
 
-    # We work with logprobs rather than probabilities for numerical stability
-    # when computing the KL divergence.
     def get_logprobs(self, prompts: list[str]) -> Tensor:
-        # We only generate one token, and we return the (log) probability distributions
-        # over the vocabulary at that token position, for each prompt.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
             output_scores=True,
             return_dict_in_generate=True,
         )
-
-        # Logits for the first (only) generated token.
         logits = outputs.scores[0]
-
-        # The returned tensor has shape (prompt, token).
         return F.log_softmax(logits, dim=-1)
 
     def get_logprobs_batched(self, prompts: list[str]) -> Tensor:
         logprobs = []
-
         for batch in batchify(prompts, self.settings.batch_size):
             logprobs.append(self.get_logprobs(batch))
-
         return torch.cat(logprobs, dim=0)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
@@ -561,25 +351,21 @@ class Model:
             add_generation_prompt=True,
             tokenize=False,
         )
-
         inputs = self.tokenizer(
             chat_prompt,
             return_tensors="pt",
             return_token_type_ids=False,
         ).to(self.model.device)
-
         streamer = TextStreamer(
             self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
         )
-
         outputs = self.model.generate(
             **inputs,
             streamer=streamer,
             max_new_tokens=4096,
         )
-
         return self.tokenizer.decode(
             outputs[0, inputs["input_ids"].shape[1] :],
             skip_special_tokens=True,
