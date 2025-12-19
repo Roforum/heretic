@@ -1,3 +1,38 @@
+[![Fork](https://img.shields.io/badge/Fork-Enhanced%20with%20Dynamic%20Support-blue)](https://github.com/Roforum/heretic)
+[![Feature](https://img.shields.io/badge/New-Universal%20Model%20Support-green)]()
+[![Feature](https://img.shields.io/badge/Improved-Refusal%20Detection%20&%20Optimization-orange)]()
+
+## 🚀 Latest Updates (Personal Fork - December 2025)
+
+This is a **personal fork** of the excellent Heretic LLM tool, with the following enhancements:
+
+### Key New Feature: Universal Support for New Hugging Face Models
+- Added **dynamic auto-registration** in `model.py` for any new or unsupported model architectures.
+- When Transformers raises an "unrecognized config" error, Heretic now automatically:
+  - Parses `config.json`
+  - Dynamically imports the correct config, model, and tokenizer classes
+  - Registers them on-the-fly
+  - Retries loading → success!
+- Requires `transformers >= 5.0.0rc0`.
+- Tested successfully on multimodal models like GLM-4.6V-Flash (10B params, single RTX 4090).
+- Full details & discussion: [llmresearch.net thread](https://llmresearch.net/threads/heretic-llm-universal-support-for-new-models-via-dynamic-auto-registration.275/)
+
+### Improvements in `config.py` (Better Abliteration Quality)
+- Switched **good prompt** to ORCA-style for more robust harmless evaluation.
+- Expanded **refusal_markers** list with additional common refusal patterns.
+- Updated **system prompt** for better optimization guidance.
+- Increased default **number of Optuna trials** from 200 to **300** (tested up to 500 for even better results on tricky models).
+- Added/tuned several other variables to improve convergence and final KL/refusal balance.
+
+These changes make Heretic more future-proof and often yield lower KL divergence with fewer refusals.
+
+> **Note:** This is not (yet) merged into the official upstream Heretic. Big thanks to the original author for the amazing foundation!  
+> Feedback & tests on new models are welcome – open an issue or comment on the forum thread.
+
+---
+
+
+
 # Heretic: Fully automatic censorship removal for language models
 
 [![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT)
