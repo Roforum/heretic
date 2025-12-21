@@ -302,9 +302,10 @@ class Model:
         )
         return self.tokenizer.batch_decode(outputs[:, inputs["input_ids"].shape[1] :])
 
-    def get_responses_batched(self, prompts: list[str]) -> list[str]:
+    def get_responses_batched(self, prompts):
         responses = []
         for batch in batchify(prompts, self.settings.batch_size):
+            batch = list(batch)
             for response in self.get_responses(batch):
                 responses.append(response)
         return responses
